@@ -4,6 +4,8 @@
 
 This is a fork of the original Affinity Script Manager but got rid of the webpage that pretends to be a native app. Yes, it runs in your machine and is accessed through your browser.
 
+Be aware, this fork is vibe coded by Oh My Pi, with only me supervising & code reviewing them.
+
 ## Features
 
 - **My Scripts:** Your local `.js` library, safely stored in your system's native user data folder and shown with name, description, size, and last-modified time. Two tabs:
