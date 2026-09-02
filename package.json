@@ -2,48 +2,15 @@
   "name": "affinity-script-manager",
   "version": "1.4.1",
   "description": "Graphic UI for managing Affinity App Scripts",
-  "main": "main.js",
+  "main": "server.js",
   "scripts": {
-    "start": "electron .",
-    "build": "electron-builder"
+    "start": "node server.js",
+    "smoke": "node scripts/smoke.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "latest"
   },
-  "devDependencies": {
-    "electron": "latest",
-    "electron-builder": "^26.8.1"
-  },
-  "build": {
-    "appId": "com.example.affinityscriptmanager",
-    "productName": "Script Manager for Affinity",
-    "files": [
-      "**/*"
-    ],
-    "mac": {
-      "target": "dmg",
-      "icon": "assets/icon.png",
-      "hardenedRuntime": true,
-      "gatekeeperAssess": false,
-      "entitlements": "build/entitlements.mac.plist",
-      "entitlementsInherit": "build/entitlements.mac.plist",
-      "notarize": true
-    },
-    "dmg": {
-      "background": "assets/DMG_background.jpg",
-      "shrink": true,
-      "window": {
-        "width": 600,
-        "height": 400
-      }
-    },
-    "win": {
-      "target": "nsis",
-      "icon": "assets/icon.png"
-    },
-    "linux": {
-      "target": "AppImage",
-      "icon": "assets/icon.png"
-    }
+  "engines": {
+    "node": ">=20"
   }
 }
