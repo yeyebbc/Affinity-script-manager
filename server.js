@@ -5,8 +5,17 @@ const store = require("./lib/store");
 const mcp = require("./lib/mcp");
 const community = require("./lib/community");
 const pkg = require("./package.json");
+// Built-in Node modules keep the server dependency surface small.
+// The HTTP layer depends on domain modules instead of owning their data.
+// store handles persistence, mcp handles Affinity, and community handles remote catalogs.
+// This dependency direction keeps transport code separate from business rules.
+// CommonJS is used because the existing package and MCP SDK imports already use it.
+// package.json is loaded once, so the running process has one stable version value.
+// A local server still needs explicit trust boundaries because browsers can reach loopback.
+// Route handlers preserve the former IPC result shapes to avoid renderer changes.
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
+const INVALID_JSON = Symbol("invalid-json");
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -20,6 +29,22 @@ const MIME = {
   ".ico": "image/x-icon",
 };
 
+// startServer is exported so smoke tests can boot the real application server.
+// Optional parameters make test ports possible without changing production defaults.
+// Environment variables provide deployment configuration without a config package.
+// The Node version check fails before any files or sockets are opened.
+// parseInt is sufficient here because only the major Node version controls compatibility.
+// store.init creates the data directory before routes can receive requests.
+// The resolved port is captured by closures and reported through the meta endpoint.
+// Host configuration is intentionally retained as an explicit project policy.
+// A Set gives constant-time add and delete for connected SSE responses.
+// latestUpdate is process-local cache state, not persistent application state.
+// SSE frames require a blank line after each event to mark the frame boundary.
+// JSON encoding prevents payload newlines from breaking the SSE wire format.
+// Broadcasting is synchronous because response.write only queues bytes to each socket.
+// Failed client writes are ignored because request close cleanup removes dead clients.
+// publishUpdate updates the cache before broadcasting, preventing late-subscriber races.
+// store receives only a callback, so it does not depend on HTTP response objects.
 async function startServer({ port, host } = {}) {
   // Node version guard (global fetch + node:fs/promises APIs).
   if (parseInt(process.versions.node, 10) < 20) {
@@ -36,6 +61,7 @@ async function startServer({ port, host } = {}) {
 
   // --- SSE hub ---
   const sseClients = new Set(); // open SSE responses
+  let latestUpdate = null;
   const sseBroadcast = (event, data) => {
     const payload = JSON.stringify(data === undefined ? null : data);
     const frame = `event: ${event}\ndata: ${payload}\n\n`;
@@ -44,6 +70,10 @@ async function startServer({ port, host } = {}) {
         res.write(frame);
       } catch {}
     }
+  };
+  const publishUpdate = (update) => {
+    latestUpdate = update;
+    sseBroadcast("update-available", update);
   };
   store.setBroadcast(sseBroadcast);
 
@@ -57,7 +87,12 @@ async function startServer({ port, host } = {}) {
   }, 25000);
 
   const server = http.createServer((req, res) => {
-    handleRequest(req, res, { sseClients, sseBroadcast, port: resolvedPort }).catch(
+    handleRequest(req, res, {
+      sseClients,
+      getLatestUpdate: () => latestUpdate,
+      publishUpdate,
+      port: resolvedPort,
+    }).catch(
       (err) => {
         console.error("unhandled request error:", err);
         if (!res.headersSent) {
@@ -90,13 +125,31 @@ async function startServer({ port, host } = {}) {
   store.startWatcher();
 
   // Fire-and-forget startup update check (silently ignore failure).
-  checkForUpdates(sseBroadcast).catch(() => {});
+  checkForUpdates(publishUpdate).catch(() => {});
 
   return server;
 }
 
+// handleRequest is the single entry point for both API and static requests.
+// URL parsing uses a dummy base because incoming server URLs are normally relative.
+// pathname excludes the query string, which keeps route matching deterministic.
+// The SSE route runs first because it is the only long-lived API response.
+// writeHead commits all stream headers before the first event is sent.
+// no-cache prevents intermediaries from replaying stale event data.
+// keep-alive communicates that the response intentionally remains open.
+// The connected comment is valid SSE and flushes initial bytes without an application event.
+// Registering the response before replay closes the broadcast-versus-connect race.
+// The request close event is the reliable place to release the response reference.
+// Cached updates are replayed only when an update actually exists.
+// Custom mutation headers force cross-origin browsers to perform a CORS preflight.
+// The X-ASM header is a CSRF barrier, not an authentication credential.
+// Body parsing is limited to methods that currently carry JSON payloads.
+// Oversize and syntax errors retain HTTP 200 to preserve the former IPC contract.
+// Static routing happens only after API dispatch declines the request.
+// Unknown paths use a conventional HTTP 404 because they are outside the IPC contract.
+// Every early return documents that exactly one response is written per request.
 async function handleRequest(req, res, ctx) {
-  const { sseClients, sseBroadcast } = ctx;
+  const { sseClients, getLatestUpdate, publishUpdate } = ctx;
   const url = new URL(req.url, "http://x");
   const pathname = url.pathname;
 
@@ -110,6 +163,11 @@ async function handleRequest(req, res, ctx) {
     res.write(": connected\n\n");
     sseClients.add(res);
     req.on("close", () => sseClients.delete(res));
+    const latestUpdate = getLatestUpdate();
+    if (latestUpdate) {
+      const payload = JSON.stringify(latestUpdate);
+      res.write(`event: update-available\ndata: ${payload}\n\n`);
+    }
     return;
   }
 
@@ -130,11 +188,21 @@ async function handleRequest(req, res, ctx) {
       req.resume(); // drain the rest so the socket can be reused
       return;
     }
+    if (read === INVALID_JSON) {
+      sendJson(res, 200, { success: false, error: "Invalid JSON" });
+      return;
+    }
     body = read;
   }
 
   if (isApi) {
-    const handled = await dispatchApi(req, res, { pathname, url, body, sseBroadcast, port: ctx.port });
+    const handled = await dispatchApi(req, res, {
+      pathname,
+      url,
+      body,
+      publishUpdate,
+      port: ctx.port,
+    });
     if (handled) return;
   }
 
@@ -145,7 +213,17 @@ async function handleRequest(req, res, ctx) {
   sendJson(res, 404, { success: false, error: "Not found" });
 }
 
-// Returns parsed JSON body, {} for empty/invalid, null when over the cap.
+// Returns parsed JSON body, {} for empty, null when over the cap.
+// Request bodies arrive as chunks and cannot be assumed to fit in one data event.
+// Counting bytes instead of characters enforces the limit before UTF-8 decoding.
+// The cap protects memory because all accepted chunks are buffered for JSON parsing.
+// Breaking immediately avoids allocating the rest of an oversized payload.
+// req.resume in the caller drains discarded bytes so the connection can finish cleanly.
+// null is reserved for oversize input and a Symbol distinguishes malformed JSON.
+// An empty body maps to an empty object because several POST routes need no fields.
+// Buffer.concat performs one final allocation after the size has been validated.
+// JSON.parse is intentionally centralized so every JSON route has identical behavior.
+// Returning a unique Symbol avoids collisions with any valid JSON value.
 async function readBody(req) {
   const chunks = [];
   let total = 0;
@@ -164,7 +242,7 @@ async function readBody(req) {
   try {
     return JSON.parse(text);
   } catch {
-    return {};
+    return INVALID_JSON;
   }
 }
 
@@ -182,9 +260,27 @@ function fail(res, err) {
   sendJson(res, 200, { success: false, error: (err && err.message) || String(err) });
 }
 
-const dec = (s) => decodeURIComponent(s);
+function dec(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw new Error("Invalid path encoding.");
+  }
+}
 
-async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }) {
+// dispatchApi performs explicit method and pathname matching without a routing framework.
+// Explicit routing makes the small API surface auditable in one file.
+// Each successful branch returns true to stop static and 404 processing.
+// Domain helpers return IPC-shaped objects that ok merges into the HTTP response.
+// fail normalizes thrown values so string and Error failures share one shape.
+// Path parameters remain encoded until a route has matched their structural position.
+// dec converts malformed percent encoding into a controlled application error.
+// Route-local try blocks keep expected failures at HTTP 200.
+// Download success is the exception because it sends bytes instead of JSON.
+// Query parameters are inspected through URLSearchParams rather than manual splitting.
+// Method checks prevent read endpoints from accidentally accepting mutations.
+// The dispatcher receives only the runtime state needed by route handlers.
+async function dispatchApi(req, res, { pathname, url, body, publishUpdate, port }) {
   const method = req.method;
 
   // --- Meta ---
@@ -193,6 +289,18 @@ async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }
     return true;
   }
 
+  // Local script routes delegate filename policy to one shared store guard.
+  // Basename and .js checks block traversal before filesystem paths are constructed.
+  // List results include metadata and filesystem statistics for the existing table UI.
+  // Content reads and writes share one route but remain separated by HTTP method.
+  // String conversion gives the editor a predictable text payload on save.
+  // Rename accepts a display-style name and lets the store derive a safe filename.
+  // Inspect parses browser-selected text without granting the server arbitrary file access.
+  // Add writes locally before its best-effort MCP installation attempt.
+  // The local filename is always decoded before the traversal guard runs.
+  // Download responses set attachment metadata so browsers preserve the script filename.
+  // Application errors during download still return JSON for the shim to recognize.
+  // Keeping raw file access behind store functions centralizes the data directory boundary.
   // --- Local scripts ---
   if (method === "GET" && pathname === "/api/scripts") {
     try {
@@ -207,8 +315,8 @@ async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }
   let match;
 
   if ((match = pathname.match(/^\/api\/scripts\/([^/]+)\/content$/)) && (method === "GET" || method === "PUT")) {
-    const file = dec(match[1]);
     try {
+      const file = dec(match[1]);
       store.assertLocalScriptFilename(file);
       if (method === "GET") ok(res, await store.readLocalScript(file));
       else ok(res, await store.saveLocalScript(file, String(body.code || "")));
@@ -253,9 +361,9 @@ async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }
   }
 
   if ((match = pathname.match(/^\/api\/scripts\/([^/]+)$/))) {
-    const file = dec(match[1]);
     if (method === "DELETE") {
       try {
+        const file = dec(match[1]);
         store.assertLocalScriptFilename(file);
         ok(res, await store.deleteLocalScript(file));
         return true;
@@ -266,6 +374,7 @@ async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }
     }
     if (method === "GET" && url.searchParams.get("download") === "1") {
       try {
+        const file = dec(match[1]);
         store.assertLocalScriptFilename(file);
         const code = await store.getLocalScriptCode(file);
         res.writeHead(200, {
@@ -281,6 +390,22 @@ async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }
     }
   }
 
+  // MCP routes translate HTTP payloads into Affinity tool calls.
+  // The MCP module owns connection reuse and reconnect behavior for every route.
+  // Library listing text is preserved because the renderer splits the original string.
+  // Push reads the authoritative local copy instead of trusting code from the request.
+  // Metadata is parsed from that same copy so title and description stay consistent.
+  // Execute accepts code directly because running arbitrary Affinity scripts is the feature.
+  // Community run fetches the remote source immediately before execution.
+  // fetchFresh bypasses stale raw GitHub cache entries for recently updated scripts.
+  // Preview first asks Affinity for the active document session identifier.
+  // render_spread needs the session identifier rather than a local file path.
+  // Image content is normalized to a data URL before crossing the HTTP boundary.
+  // MCP download sanitizes the user-selected local name before writing.
+  // Export returns bridge content as an attachment without creating a local library copy.
+  // Metadata lookup reads the full library script because list_library_scripts exposes titles only.
+  // Bridge failures remain ordinary IPC-shaped errors so the UI can show offline state.
+  // No MCP client object leaks into server routes; only callTool results cross the module boundary.
   // --- MCP bridge ---
   if (method === "GET" && pathname === "/api/bridge/library") {
     try {
@@ -377,8 +502,8 @@ async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }
   }
 
   if ((match = pathname.match(/^\/api\/bridge\/export\/([^/]+)$/)) && method === "GET") {
-    const title = dec(match[1]);
     try {
+      const title = dec(match[1]);
       const result = await mcp.callTool("read_library_script", { title });
       const code = mcp.getTextContent(result);
       if (!code) throw new Error("Empty script.");
@@ -409,6 +534,12 @@ async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }
     }
   }
 
+  // Share endpoints build issue payloads but never require GitHub credentials.
+  // Local sharing reads only guarded filenames from the managed scripts directory.
+  // MCP sharing handles scripts that exist only inside the Affinity library.
+  // Long issue bodies include a clipboard fallback because browser URLs have practical limits.
+  // Returning both baseUrl and body lets the renderer choose the safe fallback flow.
+  // Sharing is read-only from the server perspective, so these routes use GET.
   // --- Share ---
   if ((match = pathname.match(/^\/api\/share\/([^/]+)$/)) && method === "GET") {
     try {
@@ -424,8 +555,8 @@ async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }
   }
 
   if ((match = pathname.match(/^\/api\/share-mcp\/([^/]+)$/)) && method === "GET") {
-    const title = dec(match[1]);
     try {
+      const title = dec(match[1]);
       const result = await mcp.callTool("read_library_script", { title });
       const code = mcp.getTextContent(result);
       if (!code) throw new Error("Empty script.");
@@ -437,6 +568,12 @@ async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }
     }
   }
 
+  // Community listing reads repository configuration through the serialized store.
+  // One failed repository does not discard successful results from other repositories.
+  // Download means save locally and then attempt installation into Affinity.
+  // Save means keep a local editable copy without activating it in Affinity.
+  // Metadata from the registry is merged with metadata already present in source code.
+  // Local write failure is authoritative and prevents a misleading MCP-only installation.
   // --- Community ---
   if (method === "GET" && pathname === "/api/community") {
     try {
@@ -479,6 +616,10 @@ async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }
     }
   }
 
+  // Documentation comes from the MCP bridge because it matches the running Affinity SDK.
+  // Topic listing uses GET while search uses POST because the query is request data.
+  // The MCP module filters tool-level error text that may arrive in successful RPC responses.
+  // Documentation failures preserve their message for the renderer's existing error panel.
   // --- Docs ---
   if (method === "GET" && pathname === "/api/docs") {
     ok(res, await mcp.fetchSdkDocs());
@@ -490,6 +631,11 @@ async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }
     return true;
   }
 
+  // Favorites, repositories, and sidebar state share one small JSON configuration file.
+  // Read-modify-write operations are serialized in store to prevent multi-tab lost updates.
+  // Repository URLs are encoded as one path parameter when removed.
+  // Boolean coercion belongs in store so callers cannot persist non-boolean sidebar state.
+  // Repository-change events notify every open tab only after the config write completes.
   // --- Favorites / repos / settings ---
   if (method === "GET" && pathname === "/api/favorites") {
     try {
@@ -561,16 +707,20 @@ async function dispatchApi(req, res, { pathname, url, body, sseBroadcast, port }
     }
   }
 
+  // Update checks compare three numeric version components instead of lexical strings.
+  // Publishing caches the update before emitting SSE, so later tabs receive the same state.
+  // A failed GitHub request returns an error object and never stops the server.
+  // Manual and startup checks share one function to keep version semantics identical.
   // --- Updates ---
   if (method === "GET" && pathname === "/api/updates") {
-    ok(res, await checkForUpdates(sseBroadcast));
+    ok(res, await checkForUpdates(publishUpdate));
     return true;
   }
 
   return false;
 }
 
-async function checkForUpdates(sseBroadcast) {
+async function checkForUpdates(publishUpdate) {
   try {
     const currentVersion = pkg.version;
     const response = await fetch(
@@ -596,7 +746,7 @@ async function checkForUpdates(sseBroadcast) {
     }
 
     if (isNewer) {
-      sseBroadcast("update-available", {
+      publishUpdate({
         url: release.html_url,
         version: latestVersion,
       });
@@ -608,6 +758,16 @@ async function checkForUpdates(sseBroadcast) {
   }
 }
 
+// Static files are served from an allowlist rather than from arbitrary URL paths.
+// The allowlist prevents accidental exposure of config files and server source.
+// Asset requests permit one filename segment and reject nested directory traversal.
+// Extension-based MIME selection is sufficient because the asset set is controlled.
+// path.normalize removes redundant segments before the directory-prefix check.
+// Appending path.sep prevents sibling names such as assets-copy from passing the prefix test.
+// fs.access distinguishes an allowed but missing file from a valid static response.
+// sendFile reads only paths already approved by serveStatic.
+// require.main keeps imports side-effect free for tests that call startServer directly.
+// Exporting one startup function gives tests the same server behavior as npm start.
 const STATIC_ROUTES = {
   "/": ["index.html", "text/html; charset=utf-8"],
   "/index.html": ["index.html", "text/html; charset=utf-8"],

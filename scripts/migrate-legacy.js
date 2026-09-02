@@ -4,6 +4,11 @@
 const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs/promises");
+const { constants } = require("node:fs");
+// The migration is a one-way copy; legacy directories are never modified.
+// Both platform locations are checked because a shared data drive may contain either layout.
+// ASM_DATA_DIR lets tests and advanced users choose an explicit destination.
+// Promise-based filesystem calls keep control flow consistent with the server modules.
 
 const TARGET =
   process.env.ASM_DATA_DIR || path.join(os.homedir(), ".affinity-script-manager");
@@ -22,16 +27,26 @@ const SOURCES = [
   ),
 ].filter(Boolean);
 
+// COPYFILE_EXCL combines existence checking and copying into one atomic filesystem operation.
+// This avoids the race created by access followed by an ordinary copy.
+// Destination parents are created recursively before the exclusive copy.
+// EEXIST is an expected skip while every other I/O error remains fatal.
+// Returning a small status value keeps reporting separate from copy mechanics.
 async function copyIfMissing(src, dst) {
-  try {
-    await fs.access(dst);
-    return "skip (exists)";
-  } catch {}
   await fs.mkdir(path.dirname(dst), { recursive: true });
-  await fs.copyFile(src, dst);
-  return "copied";
+  try {
+    await fs.copyFile(src, dst, constants.COPYFILE_EXCL);
+    return "copied";
+  } catch (error) {
+    if (error.code === "EEXIST") return "skip (exists)";
+    throw error;
+  }
 }
 
+// Directory entries are filtered to regular .js files only.
+// Existing targets count as skipped and never change their content.
+// Sequential copies keep console output deterministic and simplify failure reporting.
+// The caller aggregates counts across every discovered legacy source.
 async function copyDir(srcDir, dstDir, label) {
   const entries = await fs.readdir(srcDir, { withFileTypes: true });
   let copied = 0;
@@ -51,6 +66,12 @@ async function copyDir(srcDir, dstDir, label) {
   return { copied, skipped };
 }
 
+// Source stat failures ignore only ENOENT because absent platform paths are normal.
+// Permission and malformed-path errors propagate to the process-level catch.
+// MyScripts and config.json are independently optional within an existing source.
+// A source is marked found only after its directory has been verified.
+// Summary counts distinguish successful copies from deliberate no-overwrite skips.
+// Completion explicitly states that source data was left untouched.
 async function main() {
   console.log("Legacy migration — Script Manager for Affinity");
   console.log(`Target: ${TARGET}`);
@@ -62,28 +83,32 @@ async function main() {
   let foundAny = false;
 
   for (const source of SOURCES) {
+    let stat;
     try {
-      const stat = await fs.stat(source);
-      if (!stat.isDirectory()) continue;
-    } catch {
-      continue;
+      stat = await fs.stat(source);
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw error;
     }
+    if (!stat.isDirectory()) continue;
     foundAny = true;
     console.log(`\nSource: ${source}`);
 
     const scriptsDir = path.join(source, "MyScripts");
     try {
-      const stat = await fs.stat(scriptsDir);
-      if (stat.isDirectory()) {
+      const scriptsStat = await fs.stat(scriptsDir);
+      if (scriptsStat.isDirectory()) {
         const r = await copyDir(scriptsDir, targetMyScripts, "MyScripts");
         totalCopied += r.copied;
         totalSkipped += r.skipped;
       }
-    } catch {}
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
 
     const configSrc = path.join(source, "config.json");
     try {
-      const status = await copyIfMissing(configSrc, targetConfig, null);
+      const status = await copyIfMissing(configSrc, targetConfig);
       if (status === "copied") {
         totalCopied++;
         console.log("  [copied] config.json");
@@ -91,7 +116,9 @@ async function main() {
         totalSkipped++;
         console.log("  [skip]   config.json");
       }
-    } catch {}
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
   }
 
   if (!foundAny) {
@@ -104,6 +131,8 @@ async function main() {
   console.log("Source directories were left untouched.");
 }
 
+// The final catch is reserved for unexpected I/O failures and returns a nonzero status.
+// Using process.exit here is safe because no child process or deferred cleanup exists.
 main().catch((err) => {
   console.error("Migration failed:", err.message);
   process.exit(1);

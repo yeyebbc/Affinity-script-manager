@@ -2,10 +2,21 @@
 // Every method matches preload.js signatures and return shapes; renderer.js is untouched.
 (function () {
   "use strict";
+  // The IIFE exposes one global API without leaking helper names into window.
+  // Strict mode turns several silent JavaScript mistakes into immediate errors.
+  // The shim preserves renderer contracts while changing only the transport.
+  // Browser-native fetch, EventSource, File, and Blob APIs remove desktop-shell dependencies.
 
   const CONTRIBUTE_URL =
     "https://github.com/JiriKrblich/Affinity-Community-Scripts/issues/new?template=contribute-script.md";
 
+  // req is the JSON transport used by every non-download API call.
+  // The custom X-ASM header forces cross-origin browser requests through CORS preflight.
+  // Content-Type remains explicit even for empty mutation bodies.
+  // undefined means no request body while other falsey values remain valid JSON.
+  // Network failures reject so existing renderer try/catch paths still work.
+  // Server application failures resolve as IPC-shaped objects for normal UI handling.
+  // Relative URLs keep all calls bound to the page's own local server origin.
   function req(method, url, body) {
     const options = {
       method,
@@ -18,6 +29,12 @@
     return fetch(url, options).then((res) => res.json());
   }
 
+  // Downloads cannot use req because successful responses are raw bytes instead of JSON.
+  // Content-Type distinguishes an application error from an attachment.
+  // Object URLs let the browser download a Blob without loading it into the page.
+  // The temporary anchor supplies a filename through the standard download attribute.
+  // Removing the anchor avoids leaving inert DOM nodes after repeated exports.
+  // Revoking the object URL releases the Blob reference after the click is dispatched.
   // Browser download helper; JSON responses (errors) are surfaced as objects.
   function download(url, fallbackName) {
     return fetch(url).then(async (res) => {
@@ -35,6 +52,13 @@
     });
   }
 
+  // One EventSource connection serves every subscription type in the page.
+  // The handler Map avoids registering duplicate native listeners for the same event.
+  // Each Set prevents the same callback reference from being stored twice.
+  // EventSource reconnect behavior is provided by the browser.
+  // JSON parsing restores structured update payloads from the text-only SSE wire format.
+  // Update callbacks keep their legacy url and version arguments.
+  // Change notifications intentionally invoke callbacks without transport-specific arguments.
   // --- EventSource subscriptions ---
   const es = new EventSource("/api/events");
   const handlers = new Map(); // event name -> Set<cb>
@@ -56,6 +80,11 @@
     handlers.get(name).add(cb);
   }
 
+  // The browser file picker replaces Electron's native dialog without server filesystem access.
+  // A detached input can retain the selected File long enough for File.text to resolve.
+  // The focus fallback handles browsers that emit no change event when selection is canceled.
+  // Promise resolution is idempotent, so a late cancel check cannot override a selected file.
+  // Only file contents and the basename are sent to the inspect endpoint.
   // --- Hidden file input for selectFile() ---
   function picker() {
     return new Promise((resolve) => {
@@ -95,6 +124,10 @@
     });
   }
 
+  // window.api is a compatibility facade rather than a new renderer-facing design.
+  // Path parameters use encodeURIComponent so filenames remain one URL segment.
+  // Mutation methods delegate validation and persistence to the server.
+  // Event subscription methods register callbacks without exposing the EventSource object.
   window.api = {
     // --- Lokální skripty ---
     listLocalScripts: () => req("GET", "/api/scripts"),
